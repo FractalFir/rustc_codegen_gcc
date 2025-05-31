@@ -1911,44 +1911,11 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
 
         let cast_res = func.new_local(self.location, dest_ty, "fti_cast_res");
         if signed {
-            // Create blocks
-            let nan = func.new_block("nan");
-            let not_nan = func.new_block("not_nan");
-            let gt_min = func.new_block("gt_min");
-            let in_bounds = func.new_block("in_bounds");
-            let gt_max = func.new_block("gt_max");
-            let lt_min = func.new_block("lt_min");
-            let after_block = func.new_block("after_cast");
-            // First, we check if the value is NAN. If it is, we jump away to the NaN block.
-            // If it is not, we continue on to the notNAN block
-            let is_nan = self.fcmp(RealPredicate::RealOEQ, val, val);
-            self.block.end_with_conditional(self.location, is_nan, nan, not_nan);
-            // If the value is NaN, assign 0 to cast_res, and jump to `after`.
-            self.switch_to_block(nan);
-            self.block.add_assignment(self.location, cast_res, zero);
-            self.block.end_with_jump(self.location, after_block);
-            // The value is not NaN. Check if it is lower than the min end of our range.
-            self.switch_to_block(not_nan);
-            self.block.end_with_conditional(self.location, less_or_nan, lt_min, gt_min);
-            // Value less than min - assign min to cast_res, jump to `after`.
-            self.switch_to_block(lt_min);
-            self.block.add_assignment(self.location, cast_res, int_min);
-            self.block.end_with_jump(self.location, after_block);
-            // Value greater than min - check if it fits within the upper end of our range.
-            self.switch_to_block(gt_min);
-            self.block.end_with_conditional(self.location, greater, gt_max, in_bounds);
-            // Value is greater than MAX - assign MAX to cast_res, jump to after.
-            self.switch_to_block(gt_max);
-            self.block.add_assignment(self.location, cast_res, int_max);
-            self.block.end_with_jump(self.location, after_block);
-            // Value in range - we can safely cast.
-            self.switch_to_block(in_bounds);
             let fptosi_result = self.fptosi(val, dest_ty);
-            self.block.add_assignment(self.location, cast_res, fptosi_result);
-            self.block.end_with_jump(self.location, after_block);
-            // The final block - read `cast_res`, continue on our merry way :).
-            self.switch_to_block(after_block);
-            return cast_res.to_rvalue();
+            let s0 = self.select(less_or_nan, int_min, fptosi_result);
+            let s1 = self.select(greater, int_max, s0);
+            let cmp = self.fcmp(RealPredicate::RealOEQ, val, val);
+            self.select(cmp, s1, zero)
         } else {
             // Create blocks
             let lt_max = func.new_block("lt_max");
@@ -1979,7 +1946,7 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
             self.block.end_with_jump(self.location, after_block);
             // The final block - read `cast_res`, continue on our merry way :).
             self.switch_to_block(after_block);
-            return cast_res.to_rvalue();
+            cast_res.to_rvalue()
         }
     }
 
