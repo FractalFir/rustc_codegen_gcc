@@ -1777,6 +1777,12 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
         dest_ty: Type<'gcc>,
     ) -> RValue<'gcc> {
         let src_ty = self.cx.val_ty(val);
+        // This function uses val quite heavily, which can lead to duplication of rvalues.
+        // Assign val to a local to prevent this.
+        /*
+        let val_local = func.new_local(self.location, src_ty, "val_local");
+        self.block.add_assignment(self.location, val_local, val);*/
+
         let (float_ty, int_ty) = if self.cx.type_kind(src_ty) == TypeKind::Vector {
             assert_eq!(self.cx.vector_length(src_ty), self.cx.vector_length(dest_ty));
             (self.cx.element_type(src_ty), self.cx.element_type(dest_ty))
@@ -1899,40 +1905,81 @@ impl<'a, 'gcc, 'tcx> Builder<'a, 'gcc, 'tcx> {
         let zero = maybe_splat(self, zero);
 
         // Step 1 ...
-        let fptosui_result =
-            if signed { self.fptosi(val, dest_ty) } else { self.fptoui(val, dest_ty) };
+        let func = self.current_func.borrow().expect("func");
         let less_or_nan = self.fcmp(RealPredicate::RealULT, val, f_min);
         let greater = self.fcmp(RealPredicate::RealOGT, val, f_max);
 
-        // Step 2: We use two comparisons and two selects, with %s1 being the
-        // result:
-        //     %less_or_nan = fcmp ult %val, %f_min
-        //     %greater = fcmp olt %val, %f_max
-        //     %s0 = select %less_or_nan, int_ty::MIN, %fptosi_result
-        //     %s1 = select %greater, int_ty::MAX, %s0
-        // Note that %less_or_nan uses an *unordered* comparison. This
-        // comparison is true if the operands are not comparable (i.e., if val is
-        // NaN). The unordered comparison ensures that s1 becomes int_ty::MIN if
-        // val is NaN.
-        //
-        // Performance note: Unordered comparison can be lowered to a "flipped"
-        // comparison and a negation, and the negation can be merged into the
-        // select. Therefore, it not necessarily any more expensive than an
-        // ordered ("normal") comparison. Whether these optimizations will be
-        // performed is ultimately up to the backend, but at least x86 does
-        // perform them.
-        let s0 = self.select(less_or_nan, int_min, fptosui_result);
-        let s1 = self.select(greater, int_max, s0);
-
-        // Step 3: NaN replacement.
-        // For unsigned types, the above step already yielded int_ty::MIN == 0 if val is NaN.
-        // Therefore we only need to execute this step for signed integer types.
+        let cast_res = func.new_local(self.location, dest_ty, "fti_cast_res");
         if signed {
-            // LLVM has no isNaN predicate, so we use (val == val) instead
-            let cmp = self.fcmp(RealPredicate::RealOEQ, val, val);
-            self.select(cmp, s1, zero)
+            // Create blocks
+            let nan = func.new_block("nan");
+            let not_nan = func.new_block("not_nan");
+            let gt_min = func.new_block("gt_min");
+            let in_bounds = func.new_block("in_bounds");
+            let gt_max = func.new_block("gt_max");
+            let lt_min = func.new_block("lt_min");
+            let after_block = func.new_block("after_cast");
+            // First, we check if the value is NAN. If it is, we jump away to the NaN block.
+            // If it is not, we continue on to the notNAN block
+            let is_nan = self.fcmp(RealPredicate::RealOEQ, val, val);
+            self.block.end_with_conditional(self.location, is_nan, nan, not_nan);
+            // If the value is NaN, assign 0 to cast_res, and jump to `after`.
+            self.switch_to_block(nan);
+            self.block.add_assignment(self.location, cast_res, zero);
+            self.block.end_with_jump(self.location, after_block);
+            // The value is not NaN. Check if it is lower than the min end of our range.
+            self.switch_to_block(not_nan);
+            self.block.end_with_conditional(self.location, less_or_nan, lt_min, gt_min);
+            // Value less than min - assign min to cast_res, jump to `after`.
+            self.switch_to_block(lt_min);
+            self.block.add_assignment(self.location, cast_res, int_min);
+            self.block.end_with_jump(self.location, after_block);
+            // Value greater than min - check if it fits within the upper end of our range.
+            self.switch_to_block(gt_min);
+            self.block.end_with_conditional(self.location, greater, gt_max, in_bounds);
+            // Value is greater than MAX - assign MAX to cast_res, jump to after.
+            self.switch_to_block(gt_max);
+            self.block.add_assignment(self.location, cast_res, int_max);
+            self.block.end_with_jump(self.location, after_block);
+            // Value in range - we can safely cast.
+            self.switch_to_block(in_bounds);
+            let fptosi_result = self.fptosi(val, dest_ty);
+            self.block.add_assignment(self.location, cast_res, fptosi_result);
+            self.block.end_with_jump(self.location, after_block);
+            // The final block - read `cast_res`, continue on our merry way :).
+            self.switch_to_block(after_block);
+            return cast_res.to_rvalue();
         } else {
-            s1
+            // Create blocks
+            let lt_max = func.new_block("lt_max");
+            let in_bounds = func.new_block("in_bounds");
+            let gt_max = func.new_block("gt_max");
+            let lt_min = func.new_block("lt_min");
+            let after_block = func.new_block("after_cast");
+            // We first start by checking if the value is greater than max. This order(opposite of singed)
+            // will allow us to save a NaN check later down the line.
+            let greater = self.fcmp(RealPredicate::RealOGT, val, f_max);
+            self.block.end_with_conditional(self.location, greater, gt_max, lt_max);
+            // Value greater than max - just assign max, jump to after.
+            self.switch_to_block(gt_max);
+            self.block.add_assignment(self.location, cast_res, int_max);
+            self.block.end_with_jump(self.location, after_block);
+            // Value not greater than max - either in range, less than, or NaN.
+            self.switch_to_block(lt_max);
+            let greater_than_zero = self.fcmp(RealPredicate::RealOGT, val, f_min);
+            self.block.end_with_conditional(self.location, greater_than_zero, in_bounds, lt_min);
+            // Value less than min - assign min to cast_res, jump to `after`.
+            self.switch_to_block(lt_min);
+            self.block.add_assignment(self.location, cast_res, int_min);
+            self.block.end_with_jump(self.location, after_block);
+            // Value in range - we can safely cast.
+            self.switch_to_block(in_bounds);
+            let fptosi_result = self.fptosi(val, dest_ty);
+            self.block.add_assignment(self.location, cast_res, fptosi_result);
+            self.block.end_with_jump(self.location, after_block);
+            // The final block - read `cast_res`, continue on our merry way :).
+            self.switch_to_block(after_block);
+            return cast_res.to_rvalue();
         }
     }
 
