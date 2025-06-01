@@ -113,7 +113,10 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
                 self.context.new_field(None, *field, format!("field{}_TODO", index))
             })
             .collect();
-        let typ = self.context.new_struct_type(None, "struct", &fields).as_type();
+        let typ = self
+            .context
+            .new_struct_type(None, self.generate_local_symbol_name("struct"), &fields)
+            .as_type();
         if packed {
             #[cfg(feature = "master")]
             typ.set_packed();
