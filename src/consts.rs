@@ -42,14 +42,18 @@ fn set_global_alignment<'gcc, 'tcx>(
 
 impl<'gcc, 'tcx> StaticCodegenMethods for CodegenCx<'gcc, 'tcx> {
     fn static_addr_of(&self, cv: RValue<'gcc>, align: Align, kind: Option<&str>) -> RValue<'gcc> {
-        if let Some(variable) = self.const_globals.borrow().get(&cv) {
-            if let Some(global_variable) = self.global_lvalues.borrow().get(variable) {
-                let alignment = align.bits() as i32;
-                if alignment > global_variable.get_alignment() {
-                    global_variable.set_alignment(alignment);
+        // TODO(antoyo): implement a proper rvalue comparison in libgccjit instead of doing the
+        // following:
+        for (value, variable) in &*self.const_globals.borrow() {
+            if format!("{:?}", value) == format!("{:?}", cv) {
+                if let Some(global_variable) = self.global_lvalues.borrow().get(variable) {
+                    let alignment = align.bits() as i32;
+                    if alignment > global_variable.get_alignment() {
+                        global_variable.set_alignment(alignment);
+                    }
                 }
+                return *variable;
             }
-            return *variable;
         }
         let global_value = self.static_addr_of_mut(cv, align, kind);
         #[cfg(feature = "master")]
@@ -295,10 +299,8 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
         global
     }
 }
-/// Converts a given const alloc to a gcc Rvalue, without any caching or deduplication.
-/// YOU SHOULD NOT call this function directly - that may break the semantics of Rust.
-/// Use `const_data_from_alloc` instead.
-pub(crate) fn const_alloc_to_gcc_uncached<'gcc>(
+
+pub fn const_alloc_to_gcc<'gcc>(
     cx: &CodegenCx<'gcc, '_>,
     alloc: ConstAllocation<'_>,
 ) -> RValue<'gcc> {
@@ -369,7 +371,7 @@ fn codegen_static_initializer<'gcc, 'tcx>(
     def_id: DefId,
 ) -> Result<(RValue<'gcc>, ConstAllocation<'tcx>), ErrorHandled> {
     let alloc = cx.tcx.eval_static_initializer(def_id)?;
-    Ok((cx.const_data_from_alloc(alloc), alloc))
+    Ok((const_alloc_to_gcc(cx, alloc), alloc))
 }
 
 fn check_and_apply_linkage<'gcc, 'tcx>(

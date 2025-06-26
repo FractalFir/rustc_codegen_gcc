@@ -9,6 +9,7 @@ use rustc_middle::mir::Mutability;
 use rustc_middle::mir::interpret::{ConstAllocation, GlobalAlloc, Scalar};
 use rustc_middle::ty::layout::LayoutOf;
 
+use crate::consts::const_alloc_to_gcc;
 use crate::context::CodegenCx;
 use crate::type_of::LayoutGccExt;
 
@@ -45,65 +46,12 @@ impl<'gcc, 'tcx> CodegenCx<'gcc, 'tcx> {
 }
 
 pub fn bytes_in_context<'gcc, 'tcx>(cx: &CodegenCx<'gcc, 'tcx>, bytes: &[u8]) -> RValue<'gcc> {
-    // Instead of always using an array of bytes, use an array of larger integers of target endianness
-    // if possible. This reduces the amount of `rvalues` we use, which reduces memory usage significantly.
-    //
-    // FIXME(FractalFir): Consider using `global_set_initializer` instead. Before this is done, we need to confirm that
-    // `global_set_initializer` is more memory efficient than the current solution.
-    // `global_set_initializer` calls `global_set_initializer_rvalue` under the hood - does it generate an array of rvalues,
-    // or is it using a more efficient representation?
-    match bytes.len() % 8 {
-        0 => {
-            let context = &cx.context;
-            let byte_type = context.new_type::<u64>();
-            let typ = context.new_array_type(None, byte_type, bytes.len() as u64 / 8);
-            let elements: Vec<_> = bytes
-                .chunks_exact(8)
-                .map(|arr| {
-                    let arr: [u8; 8] = arr.try_into().unwrap();
-                    context.new_rvalue_from_long(
-                        byte_type,
-                        // Since we are representing arbitrary byte runs as integers, we need to follow the target
-                        // endianness.
-                        match cx.sess().target.options.endian {
-                            rustc_abi::Endian::Little => u64::from_le_bytes(arr) as i64,
-                            rustc_abi::Endian::Big => u64::from_be_bytes(arr) as i64,
-                        },
-                    )
-                })
-                .collect();
-            context.new_array_constructor(None, typ, &elements)
-        }
-        4 => {
-            let context = &cx.context;
-            let byte_type = context.new_type::<u32>();
-            let typ = context.new_array_type(None, byte_type, bytes.len() as u64 / 4);
-            let elements: Vec<_> = bytes
-                .chunks_exact(4)
-                .map(|arr| {
-                    let arr: [u8; 4] = arr.try_into().unwrap();
-                    context.new_rvalue_from_int(
-                        byte_type,
-                        match cx.sess().target.options.endian {
-                            rustc_abi::Endian::Little => u32::from_le_bytes(arr) as i32,
-                            rustc_abi::Endian::Big => u32::from_be_bytes(arr) as i32,
-                        },
-                    )
-                })
-                .collect();
-            context.new_array_constructor(None, typ, &elements)
-        }
-        _ => {
-            let context = cx.context;
-            let byte_type = context.new_type::<u8>();
-            let typ = context.new_array_type(None, byte_type, bytes.len() as u64);
-            let elements: Vec<_> = bytes
-                .iter()
-                .map(|&byte| context.new_rvalue_from_int(byte_type, byte as i32))
-                .collect();
-            context.new_array_constructor(None, typ, &elements)
-        }
-    }
+    let context = &cx.context;
+    let byte_type = context.new_type::<u8>();
+    let typ = context.new_array_type(None, byte_type, bytes.len() as u64);
+    let elements: Vec<_> =
+        bytes.iter().map(|&byte| context.new_rvalue_from_int(byte_type, byte as i32)).collect();
+    context.new_array_constructor(None, typ, &elements)
 }
 
 pub fn type_is_pointer(typ: Type<'_>) -> bool {
@@ -279,6 +227,7 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
                         }
 
                         let init = self.const_data_from_alloc(alloc);
+
                         let alloc = alloc.inner();
                         let value = match alloc.mutability {
                             Mutability::Mut => self.static_addr_of_mut(init, alloc.align, None),
@@ -300,7 +249,7 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
                                 }),
                             )))
                             .unwrap_memory();
-                        let init = self.const_data_from_alloc(alloc);
+                        let init = const_alloc_to_gcc(self, alloc);
                         self.static_addr_of(init, alloc.inner().align, None)
                     }
                     GlobalAlloc::Static(def_id) => {
@@ -323,19 +272,7 @@ impl<'gcc, 'tcx> ConstCodegenMethods for CodegenCx<'gcc, 'tcx> {
     }
 
     fn const_data_from_alloc(&self, alloc: ConstAllocation<'_>) -> Self::Value {
-        // We ignore the alignment for the purpose of deduping RValues
-        // The alignment is not handled / used in any way by `const_alloc_to_gcc`,
-        // so it is OK to overwrite it here.
-        let mut mock_alloc = alloc.inner().clone();
-        mock_alloc.align = rustc_abi::Align::MAX;
-        // Check if the rvalue is already in the cache - if so, just return it directly.
-        if let Some(res) = self.const_cache.borrow().get(&mock_alloc) {
-            return *res;
-        }
-        // Rvalue not in the cache - convert and add it.
-        let res = crate::consts::const_alloc_to_gcc_uncached(self, alloc);
-        self.const_cache.borrow_mut().insert(mock_alloc, res);
-        res
+        const_alloc_to_gcc(self, alloc)
     }
 
     fn const_ptr_byte_offset(&self, base_addr: Self::Value, offset: abi::Size) -> Self::Value {
