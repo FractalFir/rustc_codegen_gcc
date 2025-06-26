@@ -39,13 +39,30 @@ fn set_global_alignment<'gcc, 'tcx>(
     }
     gv.set_alignment(align.bytes() as i32);
 }
-
+fn compare_rvalues<'gcc>(lhs: RValue<'gcc>, rhs: RValue<'gcc>) -> bool {
+    if lhs == rhs {
+        return true;
+    }
+    let lhs_type = lhs.get_type();
+    let rhs_type = rhs.get_type();
+    let Some(lhs_type) = lhs_type.is_struct() else {
+        panic!("{lhs_type:?} is not a struct.");
+    };
+    let Some(rhs_type) = rhs_type.is_struct() else {
+        panic!("{rhs_type:?} is not a struct.");
+    };
+    // Different field count - different types - different rvalues.
+    if lhs_type.get_field_count() != rhs_type.get_field_count() {
+        return false;
+    }
+    format!("{:?}", lhs) == format!("{:?}", rhs)
+}
 impl<'gcc, 'tcx> StaticCodegenMethods for CodegenCx<'gcc, 'tcx> {
     fn static_addr_of(&self, cv: RValue<'gcc>, align: Align, kind: Option<&str>) -> RValue<'gcc> {
         // TODO(antoyo): implement a proper rvalue comparison in libgccjit instead of doing the
         // following:
         for (value, variable) in &*self.const_globals.borrow() {
-            if format!("{:?}", value) == format!("{:?}", cv) {
+            if compare_rvalues(*value, cv) {
                 if let Some(global_variable) = self.global_lvalues.borrow().get(variable) {
                     let alignment = align.bits() as i32;
                     if alignment > global_variable.get_alignment() {
